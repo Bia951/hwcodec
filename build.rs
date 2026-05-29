@@ -135,7 +135,7 @@ mod ffmpeg {
                 format!("{}-{}", target_arch, target_os)
             }
         } else if target_os == "windows" {
-            "x64-windows-static".to_owned()
+            format!("{}-windows-static", target_arch)
         } else {
             format!("{}-{}", target_arch, target_os)
         };
@@ -155,7 +155,9 @@ mod ffmpeg {
         );
         {
             let mut static_libs = vec!["avcodec", "avutil", "avformat"];
-            if target_os == "windows" {
+            // Intel Quick Sync (libmfx/QSV) is x86/x64-only; FFmpeg is built without
+            // --enable-libmfx on arm64 (see res/vcpkg/ffmpeg/portfile.cmake), so don't link it there.
+            if target_os == "windows" && (target_arch == "x64" || target_arch == "x86") {
                 static_libs.push("libmfx");
             }
             static_libs
