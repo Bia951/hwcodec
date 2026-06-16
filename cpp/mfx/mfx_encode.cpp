@@ -578,8 +578,20 @@ private:
 extern "C" {
 
 int mfx_driver_support() {
-  MFXVideoSession session;
-  return InitSession(session) == MFX_ERR_NONE ? 0 : -1;
+  // Never let an exception escape this extern "C" boundary. On some Intel
+  // drivers MFXVideoSession::InitEx may throw (including non-std exceptions);
+  // letting it propagate out of C calls std::terminate -> abort ->
+  // __fastfail(FATAL_APP_EXIT) (0xc0000409 / subcode 7), crashing the host
+  // process during startup hardware-codec probing (rustdesk/rustdesk#15218).
+  try {
+    MFXVideoSession session;
+    return InitSession(session) == MFX_ERR_NONE ? 0 : -1;
+  } catch (const std::exception &e) {
+    LOG_ERROR(std::string("mfx_driver_support exception: ") + e.what());
+  } catch (...) {
+    LOG_ERROR(std::string("mfx_driver_support unknown exception"));
+  }
+  return -1;
 }
 
 int mfx_destroy_encoder(void *encoder) {
@@ -610,6 +622,8 @@ void *mfx_new_encoder(void *handle, int64_t luid,
     }
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("Exception: ") + e.what());
+  } catch (...) {
+    LOG_ERROR(std::string("Unknown exception"));
   }
 
   if (p) {
@@ -626,6 +640,8 @@ int mfx_encode(void *encoder, ID3D11Texture2D *tex, EncodeCallback callback,
     return ((VplEncoder *)encoder)->encode(tex, callback, obj, ms);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("Exception: ") + e.what());
+  } catch (...) {
+    LOG_ERROR(std::string("Unknown exception"));
   }
   return -1;
 }
@@ -674,6 +690,8 @@ int mfx_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum, 
 
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("test failed: ") + e.what());
+  } catch (...) {
+    LOG_ERROR(std::string("test failed: unknown exception"));
   }
   return -1;
 }
@@ -698,6 +716,8 @@ int mfx_set_bitrate(void *encoder, int32_t kbs) {
     return 0;
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("Exception: ") + e.what());
+  } catch (...) {
+    LOG_ERROR(std::string("Unknown exception"));
   }
   return -1;
 }

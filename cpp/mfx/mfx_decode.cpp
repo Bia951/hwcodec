@@ -416,6 +416,8 @@ void *mfx_new_decoder(void *device, int64_t luid, DataFormat codecID) {
     }
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("new failed: ") + e.what());
+  } catch (...) {
+    LOG_ERROR(std::string("new failed: unknown exception"));
   }
 
   if (p) {
@@ -435,6 +437,8 @@ int mfx_decode(void *decoder, uint8_t *data, int len, DecodeCallback callback,
     }
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("decode failed: ") + e.what());
+  } catch (...) {
+    LOG_ERROR(std::string("decode failed: unknown exception"));
   }
   return HWCODEC_ERR_COMMON;
 }
@@ -475,6 +479,8 @@ int mfx_test_decode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum,
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
+  } catch (...) {
+    LOG_ERROR(std::string("mfx_test_decode unknown exception"));
   }
   return -1;
 }
