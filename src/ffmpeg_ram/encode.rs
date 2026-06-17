@@ -9,7 +9,11 @@ use crate::{
         ffmpeg_ram_new_encoder, ffmpeg_ram_set_bitrate, CodecInfo, AV_NUM_DATA_POINTERS,
     },
 };
+#[cfg(target_os = "linux")]
+use crate::ffmpeg_ram::{ffmpeg_ram_encode_dmabuf, FfmpegDmabufFrame};
 use log::trace;
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 use std::{
     ffi::{c_void, CString},
     fmt::Display,
@@ -42,6 +46,26 @@ pub struct EncodeFrame {
     pub data: Vec<u8>,
     pub pts: i64,
     pub key: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct DmabufPlane {
+    pub fd: RawFd,
+    pub stride: u32,
+    pub offset: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct DmabufFrame {
+    pub width: usize,
+    pub height: usize,
+    pub encode_width: usize,
+    pub encode_height: usize,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub planes: Vec<DmabufPlane>,
 }
 
 impl Display for EncodeFrame {
@@ -120,6 +144,48 @@ impl Encoder {
                 self.codec,
                 (*data).as_ptr(),
                 data.len() as _,
+                self.frames as *const _ as *const c_void,
+                ms,
+            );
+            if result != 0 {
+                return Err(result);
+            }
+            Ok(&mut *self.frames)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn encode_dmabuf(
+        &mut self,
+        frame: &DmabufFrame,
+        ms: i64,
+    ) -> Result<&mut Vec<EncodeFrame>, i32> {
+        if frame.width > i32::MAX as usize
+            || frame.height > i32::MAX as usize
+            || frame.encode_width > i32::MAX as usize
+            || frame.encode_height > i32::MAX as usize
+            || frame.planes.len() > AV_NUM_DATA_POINTERS as usize
+        {
+            return Err(-1);
+        }
+        unsafe {
+            (&mut *self.frames).clear();
+            let mut c_frame: FfmpegDmabufFrame = std::mem::zeroed();
+            c_frame.width = frame.width as _;
+            c_frame.height = frame.height as _;
+            c_frame.encode_width = frame.encode_width as _;
+            c_frame.encode_height = frame.encode_height as _;
+            c_frame.fourcc = frame.fourcc;
+            c_frame.modifier = frame.modifier;
+            c_frame.nb_planes = frame.planes.len() as _;
+            for (idx, plane) in frame.planes.iter().enumerate() {
+                c_frame.planes[idx].fd = plane.fd;
+                c_frame.planes[idx].stride = plane.stride;
+                c_frame.planes[idx].offset = plane.offset;
+            }
+            let result = ffmpeg_ram_encode_dmabuf(
+                self.codec,
+                &c_frame,
                 self.frames as *const _ as *const c_void,
                 ms,
             );

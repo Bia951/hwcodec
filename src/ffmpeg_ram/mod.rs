@@ -15,6 +15,9 @@ include!(concat!(env!("OUT_DIR"), "/ffmpeg_ram_ffi.rs"));
 pub mod decode;
 pub mod encode;
 
+#[cfg(target_os = "linux")]
+pub const HAS_AVFILTER: bool = cfg!(RUSTDESK_HAS_AVFILTER);
+
 pub enum Priority {
     Best = 0,
     Good = 1,

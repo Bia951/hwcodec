@@ -8,6 +8,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let externals_dir = manifest_dir.join("externals");
     let cpp_dir = manifest_dir.join("cpp");
+    println!("cargo:rustc-check-cfg=cfg(RUSTDESK_HAS_AVFILTER)");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=deps");
     println!("cargo:rerun-if-changed={}", externals_dir.display());
@@ -100,15 +101,72 @@ mod ffmpeg {
 
     pub fn build_ffmpeg(builder: &mut Build) {
         ffmpeg_ffi();
-        link_vcpkg(builder, std::env::var("VCPKG_ROOT").unwrap().into());
+        link_ffmpeg(builder);
         link_os();
         build_ffmpeg_ram(builder);
         #[cfg(feature = "vram")]
         build_ffmpeg_vram(builder);
         build_mux(builder);
-        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+        let target_os = match std::env::var("CARGO_CFG_TARGET_OS") {
+            Ok(target_os) => target_os,
+            Err(err) => {
+                eprintln!("CARGO_CFG_TARGET_OS is not set while building hwcodec: {err}");
+                std::process::exit(1);
+            }
+        };
         if target_os == "macos" || target_os == "ios" {
             builder.flag("-std=c++11");
+        }
+    }
+
+    fn link_ffmpeg(builder: &mut Build) {
+        match std::env::var("VCPKG_ROOT").or_else(|_| std::env::var("VCPKG_INSTALLED_ROOT")) {
+            Ok(root) => {
+                link_vcpkg(builder, root.into());
+            }
+            Err(_) => {
+                let target_os = match std::env::var("CARGO_CFG_TARGET_OS") {
+                    Ok(target_os) => target_os,
+                    Err(err) => {
+                        eprintln!("CARGO_CFG_TARGET_OS is not set while building hwcodec: {err}");
+                        std::process::exit(1);
+                    }
+                };
+                if target_os == "linux" {
+                    link_pkg_config(builder);
+                } else {
+                    eprintln!("VCPKG_ROOT or VCPKG_INSTALLED_ROOT is required to build hwcodec");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    fn link_pkg_config(builder: &mut Build) {
+        for package in ["libavcodec", "libavutil", "libavformat", "libdrm", "x11"] {
+            let library = match pkg_config::Config::new().probe(package) {
+                Ok(library) => library,
+                Err(err) => {
+                    eprintln!("pkg-config lookup for '{package}' failed while building hwcodec: {err}");
+                    eprintln!(
+                        "Install FFmpeg/libdrm/X11 development packages or set VCPKG_ROOT"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            for include_path in library.include_paths {
+                builder.include(include_path);
+            }
+        }
+        if let Ok(library) = pkg_config::Config::new()
+            .statik(false)
+            .probe("libavfilter")
+        {
+            builder.define("RUSTDESK_HAS_AVFILTER", None);
+            println!("cargo:rustc-cfg=RUSTDESK_HAS_AVFILTER");
+            for include_path in library.include_paths {
+                builder.include(include_path);
+            }
         }
     }
 

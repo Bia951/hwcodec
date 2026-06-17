@@ -2,8 +2,18 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
+#ifdef __linux__
+#include <libavutil/hwcontext_drm.h>
+#ifdef RUSTDESK_HAS_AVFILTER
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+#endif
+#endif
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
+#include <libavutil/mem.h>
 #include <libavutil/opt.h>
 }
 
@@ -11,6 +21,9 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #include "common.h"
 
@@ -20,6 +33,10 @@ extern "C" {
 #ifdef _WIN32
 #include "win.h"
 #endif
+
+#define DRM_FOURCC_CODE(a, b, c, d)                                            \
+  ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) |              \
+   ((uint32_t)(d) << 24))
 
 static int calculate_offset_length(int pix_fmt, int height, const int *linesize,
                                    int *offset, int *length) {
@@ -94,6 +111,47 @@ namespace {
 typedef void (*RamEncodeCallback)(const uint8_t *data, int len, int64_t pts,
                                   int key, const void *obj);
 
+typedef struct FfmpegDmabufPlane {
+  int fd;
+  uint32_t stride;
+  uint32_t offset;
+} FfmpegDmabufPlane;
+
+typedef struct FfmpegDmabufFrame {
+  int width;
+  int height;
+  int encode_width;
+  int encode_height;
+  uint32_t fourcc;
+  uint64_t modifier;
+  int nb_planes;
+  FfmpegDmabufPlane planes[AV_NUM_DATA_POINTERS];
+} FfmpegDmabufFrame;
+
+#ifdef __linux__
+static void free_drm_prime_descriptor(void *, uint8_t *data) {
+  AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)data;
+  if (!desc)
+    return;
+  for (int i = 0; i < desc->nb_objects; ++i) {
+    if (desc->objects[i].fd >= 0)
+      close(desc->objects[i].fd);
+  }
+  av_free(desc);
+}
+
+static uint32_t drm_plane_height(uint32_t fourcc, int frame_height,
+                                 int plane_index) {
+  uint32_t height = frame_height > 0 ? static_cast<uint32_t>(frame_height) : 0;
+  switch (fourcc) {
+  case DRM_FOURCC_CODE('N', 'V', '1', '2'):
+    return plane_index == 0 ? height : (height + 1) / 2;
+  default:
+    return height;
+  }
+}
+#endif
+
 class FFmpegRamEncoder {
 public:
   AVCodecContext *c_ = NULL;
@@ -120,6 +178,9 @@ public:
   AVHWDeviceType hw_device_type_ = AV_HWDEVICE_TYPE_NONE;
   AVPixelFormat hw_pixfmt_ = AV_PIX_FMT_NONE;
   AVBufferRef *hw_device_ctx_ = NULL;
+#ifdef __linux__
+  AVBufferRef *drm_device_ctx_ = NULL;
+#endif
   AVFrame *hw_frame_ = NULL;
 
   FFmpegRamEncoder(const char *name, const char *mc_name, int width, int height,
@@ -187,6 +248,17 @@ public:
         LOG_ERROR(std::string("av_hwdevice_ctx_create failed"));
         return false;
       }
+#ifdef __linux__
+      if (hw_device_type_ == AV_HWDEVICE_TYPE_VAAPI) {
+        ret = av_hwdevice_ctx_create(&drm_device_ctx_, AV_HWDEVICE_TYPE_DRM,
+                                     NULL, NULL, 0);
+        if (ret < 0) {
+          LOG_ERROR(std::string("av_hwdevice_ctx_create DRM failed, ret = ") +
+                    av_err2str(ret));
+          return false;
+        }
+      }
+#endif
       if (set_hwframe_ctx() != 0) {
         LOG_ERROR(std::string("set_hwframe_ctx failed"));
         return false;
@@ -290,6 +362,122 @@ public:
     return do_encode(tmp_frame, obj, ms);
   }
 
+#ifdef __linux__
+  int encode_dmabuf(const FfmpegDmabufFrame *dmabuf, const void *obj,
+                    uint64_t ms) {
+    if (!dmabuf) {
+      LOG_ERROR(std::string("encode_dmabuf: frame is NULL"));
+      return -1;
+    }
+    if (hw_device_type_ == AV_HWDEVICE_TYPE_NONE || hw_pixfmt_ == AV_PIX_FMT_NONE ||
+        !c_ || !c_->hw_frames_ctx) {
+      LOG_ERROR(std::string("encode_dmabuf: hardware encoder is unavailable"));
+      return -1;
+    }
+    if (dmabuf->encode_width != width_ || dmabuf->encode_height != height_ ||
+        dmabuf->width < width_ || dmabuf->height < height_) {
+      LOG_ERROR(std::string("encode_dmabuf: frame size mismatch, got capture ") +
+                std::to_string(dmabuf->width) + "x" +
+                std::to_string(dmabuf->height) + ", encode " +
+                std::to_string(dmabuf->encode_width) + "x" +
+                std::to_string(dmabuf->encode_height) + ", expected encode " +
+                std::to_string(width_) + "x" + std::to_string(height_));
+      return -1;
+    }
+
+    AVFrame *drm_frame = create_drm_prime_frame(dmabuf);
+    if (!drm_frame)
+      return -1;
+
+    AVPixelFormat drm_sw_format = drm_fourcc_to_av_pix_fmt(dmabuf->fourcc);
+    AVFrame *mapped_frame = av_frame_alloc();
+    if (!mapped_frame) {
+      av_frame_free(&drm_frame);
+      LOG_ERROR(std::string("encode_dmabuf: av_frame_alloc failed"));
+      return -1;
+    }
+
+    AVBufferRef *source_hw_frames_ctx = NULL;
+    AVBufferRef *map_hw_frames_ctx = c_->hw_frames_ctx;
+#ifdef RUSTDESK_HAS_AVFILTER
+    if (drm_sw_format != pixfmt_) {
+      source_hw_frames_ctx = create_vaapi_hw_frames_ctx(drm_sw_format);
+      if (!source_hw_frames_ctx) {
+        av_frame_free(&mapped_frame);
+        av_frame_free(&drm_frame);
+        return -1;
+      }
+      map_hw_frames_ctx = source_hw_frames_ctx;
+    }
+#endif
+    int ret = map_dmabuf_to_hw_frame(drm_frame, mapped_frame,
+                                     map_hw_frames_ctx,
+                                     AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
+    if (ret < 0) {
+      av_frame_unref(mapped_frame);
+      ret = map_dmabuf_to_hw_frame(drm_frame, mapped_frame, map_hw_frames_ctx,
+                                   AV_HWFRAME_MAP_READ);
+    }
+    if (ret < 0) {
+      LOG_ERROR(std::string("encode_dmabuf: av_hwframe_map failed, ret = ") +
+                av_err2str(ret));
+      if (source_hw_frames_ctx)
+        av_buffer_unref(&source_hw_frames_ctx);
+      av_frame_free(&mapped_frame);
+      av_frame_free(&drm_frame);
+      return ret;
+    }
+
+#ifdef RUSTDESK_HAS_AVFILTER
+    AVFrame *encode_frame = mapped_frame;
+    AVFrame *filtered_frame = NULL;
+    if (drm_sw_format != pixfmt_) {
+      filtered_frame = av_frame_alloc();
+      if (!filtered_frame) {
+        LOG_ERROR(std::string("encode_dmabuf: filtered av_frame_alloc failed"));
+        if (source_hw_frames_ctx)
+          av_buffer_unref(&source_hw_frames_ctx);
+        av_frame_free(&mapped_frame);
+        av_frame_free(&drm_frame);
+        return -1;
+      }
+      ret = filter_vaapi_to_nv12(mapped_frame, filtered_frame);
+      if (ret < 0) {
+        av_frame_free(&filtered_frame);
+        if (source_hw_frames_ctx)
+          av_buffer_unref(&source_hw_frames_ctx);
+        av_frame_free(&mapped_frame);
+        av_frame_free(&drm_frame);
+        return ret;
+      }
+      encode_frame = filtered_frame;
+    }
+
+    ret = do_encode(encode_frame, obj, ms);
+    if (filtered_frame)
+      av_frame_free(&filtered_frame);
+#else
+    if (drm_sw_format != pixfmt_) {
+      LOG_ERROR(std::string("encode_dmabuf: DRM fourcc requires VAAPI format conversion, but libavfilter is unavailable"));
+      av_frame_free(&mapped_frame);
+      av_frame_free(&drm_frame);
+      return -1;
+    }
+    ret = do_encode(mapped_frame, obj, ms);
+#endif
+    if (source_hw_frames_ctx)
+      av_buffer_unref(&source_hw_frames_ctx);
+    av_frame_free(&mapped_frame);
+    av_frame_free(&drm_frame);
+    return ret;
+  }
+#else
+  int encode_dmabuf(const FfmpegDmabufFrame *, const void *, uint64_t) {
+    LOG_ERROR(std::string("encode_dmabuf: DRM PRIME input is unsupported on this platform"));
+    return -1;
+  }
+#endif
+
   void free_encoder() {
     if (pkt_)
       av_packet_free(&pkt_);
@@ -299,6 +487,10 @@ public:
       av_frame_free(&hw_frame_);
     if (hw_device_ctx_)
       av_buffer_unref(&hw_device_ctx_);
+#ifdef __linux__
+    if (drm_device_ctx_)
+      av_buffer_unref(&drm_device_ctx_);
+#endif
     if (c_)
       avcodec_free_context(&c_);
   }
@@ -365,6 +557,275 @@ private:
     av_packet_unref(pkt_);
     return encoded ? 0 : -1;
   }
+
+#ifdef __linux__
+  AVFrame *create_drm_prime_frame(const FfmpegDmabufFrame *dmabuf) {
+    if (dmabuf->nb_planes <= 0 || dmabuf->nb_planes > AV_DRM_MAX_PLANES) {
+      LOG_ERROR(std::string("create_drm_prime_frame: unsupported plane count ") +
+                std::to_string(dmabuf->nb_planes));
+      return NULL;
+    }
+
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) {
+      LOG_ERROR(std::string("create_drm_prime_frame: av_frame_alloc failed"));
+      return NULL;
+    }
+
+    AVDRMFrameDescriptor *desc =
+        (AVDRMFrameDescriptor *)av_mallocz(sizeof(AVDRMFrameDescriptor));
+    if (!desc) {
+      av_frame_free(&frame);
+      LOG_ERROR(std::string("create_drm_prime_frame: av_mallocz failed"));
+      return NULL;
+    }
+    for (int i = 0; i < AV_DRM_MAX_PLANES; ++i)
+      desc->objects[i].fd = -1;
+
+    for (int i = 0; i < dmabuf->nb_planes; ++i) {
+      int fd = dup(dmabuf->planes[i].fd);
+      if (fd < 0) {
+        LOG_ERROR(std::string("create_drm_prime_frame: dup failed"));
+        desc->nb_objects = i;
+        free_drm_prime_descriptor(NULL, (uint8_t *)desc);
+        av_frame_free(&frame);
+        return NULL;
+      }
+      desc->objects[i].fd = fd;
+      uint32_t plane_height = drm_plane_height(dmabuf->fourcc, dmabuf->height, i);
+      desc->objects[i].size =
+          dmabuf->planes[i].offset + dmabuf->planes[i].stride * plane_height;
+      desc->objects[i].format_modifier = dmabuf->modifier;
+      desc->nb_objects = i + 1;
+    }
+
+    desc->nb_layers = 1;
+    desc->layers[0].format = dmabuf->fourcc;
+    desc->layers[0].nb_planes = dmabuf->nb_planes;
+    for (int i = 0; i < dmabuf->nb_planes; ++i) {
+      desc->layers[0].planes[i].object_index = i;
+      desc->layers[0].planes[i].offset = dmabuf->planes[i].offset;
+      desc->layers[0].planes[i].pitch = dmabuf->planes[i].stride;
+    }
+
+    frame->buf[0] = av_buffer_create((uint8_t *)desc, sizeof(*desc),
+                                     free_drm_prime_descriptor, NULL, 0);
+    if (!frame->buf[0]) {
+      free_drm_prime_descriptor(NULL, (uint8_t *)desc);
+      av_frame_free(&frame);
+      LOG_ERROR(std::string("create_drm_prime_frame: av_buffer_create failed"));
+      return NULL;
+    }
+    frame->data[0] = frame->buf[0]->data;
+    frame->format = AV_PIX_FMT_DRM_PRIME;
+    frame->width = dmabuf->encode_width;
+    frame->height = dmabuf->encode_height;
+    frame->hw_frames_ctx = create_drm_hw_frames_ctx(dmabuf);
+    if (!frame->hw_frames_ctx) {
+      av_frame_free(&frame);
+      return NULL;
+    }
+    return frame;
+  }
+
+  AVBufferRef *create_drm_hw_frames_ctx(const FfmpegDmabufFrame *dmabuf) {
+    if (!drm_device_ctx_) {
+      LOG_ERROR(std::string("create_drm_hw_frames_ctx: DRM device is unavailable"));
+      return NULL;
+    }
+    AVPixelFormat sw_format = drm_fourcc_to_av_pix_fmt(dmabuf->fourcc);
+    if (sw_format == AV_PIX_FMT_NONE) {
+      LOG_ERROR(std::string("create_drm_hw_frames_ctx: unsupported DRM fourcc ") +
+                std::to_string(dmabuf->fourcc));
+      return NULL;
+    }
+
+    AVBufferRef *frames_ref = av_hwframe_ctx_alloc(drm_device_ctx_);
+    if (!frames_ref) {
+      LOG_ERROR(std::string("create_drm_hw_frames_ctx: av_hwframe_ctx_alloc failed"));
+      return NULL;
+    }
+    AVHWFramesContext *frames_ctx = (AVHWFramesContext *)frames_ref->data;
+    frames_ctx->format = AV_PIX_FMT_DRM_PRIME;
+    frames_ctx->sw_format = sw_format;
+    frames_ctx->width = dmabuf->encode_width;
+    frames_ctx->height = dmabuf->encode_height;
+    frames_ctx->initial_pool_size = 0;
+    int ret = av_hwframe_ctx_init(frames_ref);
+    if (ret < 0) {
+      LOG_ERROR(std::string("create_drm_hw_frames_ctx: av_hwframe_ctx_init failed, ret = ") +
+                av_err2str(ret));
+      av_buffer_unref(&frames_ref);
+      return NULL;
+    }
+    return frames_ref;
+  }
+
+  AVBufferRef *create_vaapi_hw_frames_ctx(AVPixelFormat sw_format) {
+    if (!hw_device_ctx_) {
+      LOG_ERROR(std::string("create_vaapi_hw_frames_ctx: VAAPI device is unavailable"));
+      return NULL;
+    }
+
+    AVBufferRef *frames_ref = av_hwframe_ctx_alloc(hw_device_ctx_);
+    if (!frames_ref) {
+      LOG_ERROR(std::string("create_vaapi_hw_frames_ctx: av_hwframe_ctx_alloc failed"));
+      return NULL;
+    }
+    AVHWFramesContext *frames_ctx = (AVHWFramesContext *)frames_ref->data;
+    frames_ctx->format = hw_pixfmt_;
+    frames_ctx->sw_format = sw_format;
+    frames_ctx->width = width_;
+    frames_ctx->height = height_;
+    frames_ctx->initial_pool_size = 0;
+    int ret = av_hwframe_ctx_init(frames_ref);
+    if (ret < 0) {
+      LOG_ERROR(std::string("create_vaapi_hw_frames_ctx: av_hwframe_ctx_init failed, ret = ") +
+                av_err2str(ret));
+      av_buffer_unref(&frames_ref);
+      return NULL;
+    }
+    return frames_ref;
+  }
+
+  AVPixelFormat drm_fourcc_to_av_pix_fmt(uint32_t fourcc) {
+    switch (fourcc) {
+    case DRM_FOURCC_CODE('N', 'V', '1', '2'):
+      return AV_PIX_FMT_NV12;
+    case DRM_FOURCC_CODE('X', 'R', '2', '4'):
+      return AV_PIX_FMT_BGR0;
+    case DRM_FOURCC_CODE('A', 'R', '2', '4'):
+      return AV_PIX_FMT_BGRA;
+    case DRM_FOURCC_CODE('X', 'B', '2', '4'):
+      return AV_PIX_FMT_RGB0;
+    case DRM_FOURCC_CODE('A', 'B', '2', '4'):
+      return AV_PIX_FMT_RGBA;
+    default:
+      return AV_PIX_FMT_NONE;
+    }
+  }
+
+  int map_dmabuf_to_hw_frame(AVFrame *drm_frame, AVFrame *mapped_frame,
+                             AVBufferRef *hw_frames_ctx, int flags) {
+    mapped_frame->format = hw_pixfmt_;
+    mapped_frame->width = width_;
+    mapped_frame->height = height_;
+    mapped_frame->color_range = c_->color_range;
+    mapped_frame->color_primaries = c_->color_primaries;
+    mapped_frame->color_trc = c_->color_trc;
+    mapped_frame->colorspace = c_->colorspace;
+    mapped_frame->chroma_location = c_->chroma_sample_location;
+    mapped_frame->hw_frames_ctx = av_buffer_ref(hw_frames_ctx);
+    if (!mapped_frame->hw_frames_ctx) {
+      LOG_ERROR(std::string("map_dmabuf_to_hw_frame: av_buffer_ref failed"));
+      return -1;
+    }
+    return av_hwframe_map(mapped_frame, drm_frame, flags);
+  }
+
+#ifdef RUSTDESK_HAS_AVFILTER
+  int filter_vaapi_to_nv12(AVFrame *input_frame, AVFrame *output_frame) {
+    AVFilterGraph *graph = avfilter_graph_alloc();
+    if (!graph) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: avfilter_graph_alloc failed"));
+      return -1;
+    }
+
+    AVFilterContext *src_ctx = NULL;
+    AVFilterContext *scale_ctx = NULL;
+    AVFilterContext *sink_ctx = NULL;
+    int ret = 0;
+
+    const AVFilter *src = avfilter_get_by_name("buffer");
+    const AVFilter *scale = avfilter_get_by_name("scale_vaapi");
+    const AVFilter *sink = avfilter_get_by_name("buffersink");
+    if (!src || !scale || !sink) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: required filters are unavailable"));
+      ret = -1;
+      goto _exit;
+    }
+
+    if ((ret = avfilter_graph_create_filter(&src_ctx, src, "in", NULL, NULL, graph)) < 0) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: create buffer failed, ret = ") +
+                av_err2str(ret));
+      goto _exit;
+    }
+    {
+      AVBufferSrcParameters *params = av_buffersrc_parameters_alloc();
+      if (!params) {
+        LOG_ERROR(std::string("filter_vaapi_to_nv12: av_buffersrc_parameters_alloc failed"));
+        ret = -1;
+        goto _exit;
+      }
+      params->format = input_frame->format;
+      params->width = input_frame->width;
+      params->height = input_frame->height;
+      params->time_base = AVRational{1, 1000};
+      params->sample_aspect_ratio = AVRational{1, 1};
+      params->hw_frames_ctx = input_frame->hw_frames_ctx;
+      ret = av_buffersrc_parameters_set(src_ctx, params);
+      av_free(params);
+      if (ret < 0) {
+        LOG_ERROR(std::string("filter_vaapi_to_nv12: parameters set failed, ret = ") +
+                  av_err2str(ret));
+        goto _exit;
+      }
+      if ((ret = avfilter_init_str(src_ctx, NULL)) < 0) {
+        LOG_ERROR(std::string("filter_vaapi_to_nv12: buffer init failed, ret = ") +
+                  av_err2str(ret));
+        goto _exit;
+      }
+    }
+
+    if ((ret = avfilter_graph_create_filter(&scale_ctx, scale, "scale",
+                                            "format=nv12", NULL, graph)) < 0) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: create scale_vaapi failed, ret = ") +
+                av_err2str(ret));
+      goto _exit;
+    }
+    scale_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
+    if (!scale_ctx->hw_device_ctx) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: av_buffer_ref hw device failed"));
+      ret = -1;
+      goto _exit;
+    }
+
+    if ((ret = avfilter_graph_create_filter(&sink_ctx, sink, "out", NULL, NULL, graph)) < 0) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: create buffersink failed, ret = ") +
+                av_err2str(ret));
+      goto _exit;
+    }
+
+    if ((ret = avfilter_link(src_ctx, 0, scale_ctx, 0)) < 0 ||
+        (ret = avfilter_link(scale_ctx, 0, sink_ctx, 0)) < 0) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: link filters failed, ret = ") +
+                av_err2str(ret));
+      goto _exit;
+    }
+    if ((ret = avfilter_graph_config(graph, NULL)) < 0) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: graph config failed, ret = ") +
+                av_err2str(ret));
+      goto _exit;
+    }
+    if ((ret = av_buffersrc_add_frame_flags(src_ctx, input_frame,
+                                            AV_BUFFERSRC_FLAG_KEEP_REF)) < 0) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: add frame failed, ret = ") +
+                av_err2str(ret));
+      goto _exit;
+    }
+    ret = av_buffersink_get_frame(sink_ctx, output_frame);
+    if (ret < 0) {
+      LOG_ERROR(std::string("filter_vaapi_to_nv12: get frame failed, ret = ") +
+                av_err2str(ret));
+      goto _exit;
+    }
+
+  _exit:
+    avfilter_graph_free(&graph);
+    return ret;
+  }
+#endif
+#endif
 
   int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
                  const int *const offset) {
@@ -440,6 +901,18 @@ extern "C" int ffmpeg_ram_encode(FFmpegRamEncoder *encoder, const uint8_t *data,
     return encoder->encode(data, length, obj, ms);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_ram_encode failed, ") + std::string(e.what()));
+  }
+  return -1;
+}
+
+extern "C" int ffmpeg_ram_encode_dmabuf(FFmpegRamEncoder *encoder,
+                                        const FfmpegDmabufFrame *frame,
+                                        const void *obj, uint64_t ms) {
+  try {
+    return encoder->encode_dmabuf(frame, obj, ms);
+  } catch (const std::exception &e) {
+    LOG_ERROR(std::string("ffmpeg_ram_encode_dmabuf failed, ") +
+              std::string(e.what()));
   }
   return -1;
 }

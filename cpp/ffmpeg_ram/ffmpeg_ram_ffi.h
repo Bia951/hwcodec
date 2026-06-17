@@ -12,6 +12,23 @@ typedef void (*RamDecodeCallback)(const void *obj, int width, int height,
 typedef void (*RamEncodeCallback)(const uint8_t *data, int len, int64_t pts,
                                   int key, const void *obj);
 
+typedef struct FfmpegDmabufPlane {
+  int fd;
+  uint32_t stride;
+  uint32_t offset;
+} FfmpegDmabufPlane;
+
+typedef struct FfmpegDmabufFrame {
+  int width;
+  int height;
+  int encode_width;
+  int encode_height;
+  uint32_t fourcc;
+  uint64_t modifier;
+  int nb_planes;
+  FfmpegDmabufPlane planes[AV_NUM_DATA_POINTERS];
+} FfmpegDmabufFrame;
+
 void *ffmpeg_ram_new_encoder(const char *name, const char *mc_name, int width,
                              int height, int pixfmt, int align, int fps,
                              int gop, int rc, int quality, int kbs, int q,
@@ -22,6 +39,8 @@ void *ffmpeg_ram_new_decoder(const char *name, int device_type,
                              int thread_count, RamDecodeCallback callback);
 int ffmpeg_ram_encode(void *encoder, const uint8_t *data, int length,
                       const void *obj, int64_t ms);
+int ffmpeg_ram_encode_dmabuf(void *encoder, const FfmpegDmabufFrame *frame,
+                             const void *obj, int64_t ms);
 int ffmpeg_ram_decode(void *decoder, const uint8_t *data, int length,
                       const void *obj);
 void ffmpeg_ram_free_encoder(void *encoder);
