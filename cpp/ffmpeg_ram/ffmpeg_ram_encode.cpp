@@ -555,7 +555,14 @@ private:
     }
   _exit:
     av_packet_unref(pkt_);
-    return encoded ? 0 : -1;
+    if (encoded)
+      return 0;
+    // No packet was produced. EAGAIN only means the encoder needs more input
+    // (warm-up / lookahead delay), which is not an error; report success so the
+    // caller keeps feeding frames instead of treating it as an encode failure.
+    if (ret == AVERROR(EAGAIN))
+      return 0;
+    return -1;
   }
 
 #ifdef __linux__
