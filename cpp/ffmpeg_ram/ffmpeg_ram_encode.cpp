@@ -250,10 +250,15 @@ public:
       }
 #ifdef __linux__
       if (hw_device_type_ == AV_HWDEVICE_TYPE_VAAPI) {
-        ret = av_hwdevice_ctx_create(&drm_device_ctx_, AV_HWDEVICE_TYPE_DRM,
-                                     NULL, NULL, 0);
+        // Derive the DRM device from the VAAPI device rather than opening a DRM
+        // node by path: passing NULL to av_hwdevice_ctx_create(DRM) makes ffmpeg
+        // do open(NULL) -> EFAULT ("Bad address"), and deriving also guarantees
+        // the DRM device refers to the same GPU as the VAAPI device.
+        ret = av_hwdevice_ctx_create_derived(&drm_device_ctx_,
+                                             AV_HWDEVICE_TYPE_DRM, hw_device_ctx_,
+                                             0);
         if (ret < 0) {
-          LOG_ERROR(std::string("av_hwdevice_ctx_create DRM failed, ret = ") +
+          LOG_ERROR(std::string("av_hwdevice_ctx_create_derived DRM failed, ret = ") +
                     av_err2str(ret));
           return false;
         }
