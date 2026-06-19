@@ -241,29 +241,45 @@ public:
         }
       }
 #endif
-      ret = av_hwdevice_ctx_create(&hw_device_ctx_, hw_device_type_,
-                                   device.length() == 0 ? NULL : device.c_str(),
-                                   NULL, 0);
-      if (ret < 0) {
-        LOG_ERROR(std::string("av_hwdevice_ctx_create failed"));
-        return false;
-      }
 #ifdef __linux__
       if (hw_device_type_ == AV_HWDEVICE_TYPE_VAAPI) {
-        // Derive the DRM device from the VAAPI device rather than opening a DRM
-        // node by path: passing NULL to av_hwdevice_ctx_create(DRM) makes ffmpeg
-        // do open(NULL) -> EFAULT ("Bad address"), and deriving also guarantees
-        // the DRM device refers to the same GPU as the VAAPI device.
-        ret = av_hwdevice_ctx_create_derived(&drm_device_ctx_,
-                                             AV_HWDEVICE_TYPE_DRM, hw_device_ctx_,
-                                             0);
+        // For dmabuf import we need a DRM device to wrap the incoming PRIME fd.
+        // FFmpeg can derive VAAPI *from* DRM (vaapi_device_derive) but NOT a DRM
+        // device from VAAPI -- hwcontext_drm has no device_derive, so that path
+        // returns ENOSYS ("Function not implemented"). So open a render node
+        // explicitly and derive the VAAPI device from it; both then share the
+        // same GPU fd. (Passing NULL to av_hwdevice_ctx_create(DRM) is also
+        // wrong: ffmpeg does open(NULL) -> EFAULT "Bad address".)
+        const char *render_node = getenv("RUSTDESK_VAAPI_RENDER_NODE");
+        if (!render_node || !*render_node) {
+          render_node = "/dev/dri/renderD128";
+        }
+        ret = av_hwdevice_ctx_create(&drm_device_ctx_, AV_HWDEVICE_TYPE_DRM,
+                                     render_node, NULL, 0);
         if (ret < 0) {
-          LOG_ERROR(std::string("av_hwdevice_ctx_create_derived DRM failed, ret = ") +
+          LOG_ERROR(std::string("av_hwdevice_ctx_create DRM (") + render_node +
+                    ") failed, ret = " + av_err2str(ret));
+          return false;
+        }
+        ret = av_hwdevice_ctx_create_derived(&hw_device_ctx_,
+                                             AV_HWDEVICE_TYPE_VAAPI,
+                                             drm_device_ctx_, 0);
+        if (ret < 0) {
+          LOG_ERROR(std::string("av_hwdevice_ctx_create_derived VAAPI failed, ret = ") +
                     av_err2str(ret));
           return false;
         }
-      }
+      } else
 #endif
+      {
+        ret = av_hwdevice_ctx_create(&hw_device_ctx_, hw_device_type_,
+                                     device.length() == 0 ? NULL : device.c_str(),
+                                     NULL, 0);
+        if (ret < 0) {
+          LOG_ERROR(std::string("av_hwdevice_ctx_create failed"));
+          return false;
+        }
+      }
       if (set_hwframe_ctx() != 0) {
         LOG_ERROR(std::string("set_hwframe_ctx failed"));
         return false;
