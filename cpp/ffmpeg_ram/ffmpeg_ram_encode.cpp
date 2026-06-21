@@ -23,6 +23,8 @@ extern "C" {
 #include <string.h>
 #ifdef __linux__
 #include <unistd.h>
+#include <fstream>
+#include <vector>
 #endif
 
 #include "common.h"
@@ -247,25 +249,64 @@ public:
         // FFmpeg can derive VAAPI *from* DRM (vaapi_device_derive) but NOT a DRM
         // device from VAAPI -- hwcontext_drm has no device_derive, so that path
         // returns ENOSYS ("Function not implemented"). So open a render node
-        // explicitly and derive the VAAPI device from it; both then share the
-        // same GPU fd. (Passing NULL to av_hwdevice_ctx_create(DRM) is also
-        // wrong: ffmpeg does open(NULL) -> EFAULT "Bad address".)
-        const char *render_node = getenv("RUSTDESK_VAAPI_RENDER_NODE");
-        if (!render_node || !*render_node) {
-          render_node = "/dev/dri/renderD128";
+        // explicitly and derive the VAAPI device from it. (Passing NULL to
+        // av_hwdevice_ctx_create(DRM) is also wrong: ffmpeg does open(NULL) ->
+        // EFAULT "Bad address".)
+        //
+        // Multi-GPU: on Intel-iGPU + NVIDIA-dGPU laptops renderD128 is often the
+        // NVIDIA node (nouveau), which exposes VAAPI but has NO encode entrypoints,
+        // so the encoder silently fails and the caller falls back to software. So
+        // honor RUSTDESK_VAAPI_RENDER_NODE, else scan /dev/dri/renderD* and skip
+        // nvidia/nouveau, picking the first node we can create a VAAPI device on
+        // (i915/amdgpu). Done here (not via env) because the rustdesk server is a
+        // separate process that would not inherit an env override.
+        std::vector<std::string> candidates;
+        const char *forced = getenv("RUSTDESK_VAAPI_RENDER_NODE");
+        if (forced && *forced) {
+          candidates.emplace_back(forced);
+        } else {
+          for (int i = 128; i < 136; ++i) {
+            std::string idx = std::to_string(i);
+            std::ifstream uevent("/sys/class/drm/renderD" + idx +
+                                 "/device/uevent");
+            if (!uevent) {
+              continue;
+            }
+            std::string line, driver;
+            while (std::getline(uevent, line)) {
+              if (line.rfind("DRIVER=", 0) == 0) {
+                driver = line.substr(7);
+                break;
+              }
+            }
+            if (driver.empty() || driver == "nvidia" || driver == "nouveau") {
+              continue;  // no VAAPI encode on these
+            }
+            candidates.emplace_back("/dev/dri/renderD" + idx);
+          }
+          if (candidates.empty()) {
+            candidates.emplace_back("/dev/dri/renderD128");
+          }
         }
-        ret = av_hwdevice_ctx_create(&drm_device_ctx_, AV_HWDEVICE_TYPE_DRM,
-                                     render_node, NULL, 0);
-        if (ret < 0) {
-          LOG_ERROR(std::string("av_hwdevice_ctx_create DRM (") + render_node +
-                    ") failed, ret = " + av_err2str(ret));
-          return false;
+
+        ret = -1;
+        for (const std::string &node : candidates) {
+          ret = av_hwdevice_ctx_create(&drm_device_ctx_, AV_HWDEVICE_TYPE_DRM,
+                                       node.c_str(), NULL, 0);
+          if (ret < 0) {
+            continue;
+          }
+          ret = av_hwdevice_ctx_create_derived(
+              &hw_device_ctx_, AV_HWDEVICE_TYPE_VAAPI, drm_device_ctx_, 0);
+          if (ret >= 0) {
+            LOG_INFO(std::string("VAAPI encode render node: ") + node);
+            break;
+          }
+          av_buffer_unref(&drm_device_ctx_);
         }
-        ret = av_hwdevice_ctx_create_derived(&hw_device_ctx_,
-                                             AV_HWDEVICE_TYPE_VAAPI,
-                                             drm_device_ctx_, 0);
         if (ret < 0) {
-          LOG_ERROR(std::string("av_hwdevice_ctx_create_derived VAAPI failed, ret = ") +
+          LOG_ERROR(std::string("failed to create a VAAPI device from any "
+                                "render node, ret = ") +
                     av_err2str(ret));
           return false;
         }
