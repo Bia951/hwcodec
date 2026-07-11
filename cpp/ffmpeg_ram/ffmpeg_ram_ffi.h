@@ -29,8 +29,9 @@ typedef struct FfmpegDmabufFrame {
   FfmpegDmabufPlane planes[AV_NUM_DATA_POINTERS];
 } FfmpegDmabufFrame;
 
-void *ffmpeg_ram_new_encoder(const char *name, const char *mc_name, int width,
-                             int height, int pixfmt, int align, int fps,
+void *ffmpeg_ram_new_encoder(const char *name, const char *mc_name,
+                             const char *device_path, int width, int height,
+                             int pixfmt, int align, int fps,
                              int gop, int rc, int quality, int kbs, int q,
                              int thread_count, int gpu, int *linesize,
                              int *offset, int *length,
@@ -41,6 +42,8 @@ int ffmpeg_ram_encode(void *encoder, const uint8_t *data, int length,
                       const void *obj, int64_t ms);
 int ffmpeg_ram_encode_dmabuf(void *encoder, const FfmpegDmabufFrame *frame,
                              const void *obj, int64_t ms);
+int ffmpeg_ram_download_dmabuf(void *encoder, const FfmpegDmabufFrame *frame,
+                               const void *obj, RamDecodeCallback callback);
 int ffmpeg_ram_decode(void *decoder, const uint8_t *data, int length,
                       const void *obj);
 void ffmpeg_ram_free_encoder(void *encoder);

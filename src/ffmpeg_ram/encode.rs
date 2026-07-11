@@ -10,7 +10,11 @@ use crate::{
     },
 };
 #[cfg(target_os = "linux")]
-use crate::ffmpeg_ram::{ffmpeg_ram_encode_dmabuf, FfmpegDmabufFrame};
+use crate::ffmpeg_ram::{
+    ffmpeg_ram_download_dmabuf, ffmpeg_ram_encode_dmabuf, FfmpegDmabufFrame,
+};
+#[cfg(target_os = "linux")]
+use super::decode::DecodeFrame;
 use log::trace;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
@@ -85,6 +89,10 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(ctx: EncodeContext) -> Result<Self, ()> {
+        Self::new_with_device(ctx, None)
+    }
+
+    pub fn new_with_device(ctx: EncodeContext, device_path: Option<&str>) -> Result<Self, ()> {
         init_av_log();
         if ctx.width % 2 == 1 || ctx.height % 2 == 1 {
             return Err(());
@@ -101,9 +109,11 @@ impl Encoder {
                 .parse()
                 .unwrap_or(-1);
             let mc_name = ctx.mc_name.clone().unwrap_or_default();
+            let device_path = CString::new(device_path.unwrap_or_default()).map_err(|_| ())?;
             let codec = ffmpeg_ram_new_encoder(
                 CString::new(ctx.name.as_str()).map_err(|_| ())?.as_ptr(),
                 CString::new(mc_name.as_str()).map_err(|_| ())?.as_ptr(),
+                device_path.as_ptr(),
                 ctx.width,
                 ctx.height,
                 ctx.pixfmt as c_int,
@@ -160,6 +170,42 @@ impl Encoder {
         frame: &DmabufFrame,
         ms: i64,
     ) -> Result<&mut Vec<EncodeFrame>, i32> {
+        let c_frame = Self::ffi_dmabuf_frame(frame)?;
+        unsafe {
+            (&mut *self.frames).clear();
+            let result = ffmpeg_ram_encode_dmabuf(
+                self.codec,
+                &c_frame,
+                self.frames as *const _ as *const c_void,
+                ms,
+            );
+            if result != 0 {
+                return Err(result);
+            }
+            Ok(&mut *self.frames)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn download_dmabuf(&mut self, frame: &DmabufFrame) -> Result<DecodeFrame, i32> {
+        let c_frame = Self::ffi_dmabuf_frame(frame)?;
+        let mut frames = Vec::<DecodeFrame>::new();
+        let result = unsafe {
+            ffmpeg_ram_download_dmabuf(
+                self.codec,
+                &c_frame,
+                &mut frames as *mut _ as *const c_void,
+                Some(Self::download_callback),
+            )
+        };
+        if result != 0 {
+            return Err(result);
+        }
+        frames.pop().ok_or(-1)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ffi_dmabuf_frame(frame: &DmabufFrame) -> Result<FfmpegDmabufFrame, i32> {
         if frame.width > i32::MAX as usize
             || frame.height > i32::MAX as usize
             || frame.encode_width > i32::MAX as usize
@@ -169,7 +215,6 @@ impl Encoder {
             return Err(-1);
         }
         unsafe {
-            (&mut *self.frames).clear();
             let mut c_frame: FfmpegDmabufFrame = std::mem::zeroed();
             c_frame.width = frame.width as _;
             c_frame.height = frame.height as _;
@@ -183,17 +228,47 @@ impl Encoder {
                 c_frame.planes[idx].stride = plane.stride;
                 c_frame.planes[idx].offset = plane.offset;
             }
-            let result = ffmpeg_ram_encode_dmabuf(
-                self.codec,
-                &c_frame,
-                self.frames as *const _ as *const c_void,
-                ms,
-            );
-            if result != 0 {
-                return Err(result);
-            }
-            Ok(&mut *self.frames)
+            Ok(c_frame)
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" fn download_callback(
+        obj: *const c_void,
+        width: c_int,
+        height: c_int,
+        pixfmt: c_int,
+        linesizes: *mut c_int,
+        datas: *mut *mut u8,
+        _key: c_int,
+    ) {
+        if width <= 0 || height <= 0 || pixfmt != AVPixelFormat::AV_PIX_FMT_NV12 as c_int {
+            return;
+        }
+        let linesizes = slice::from_raw_parts(linesizes, AV_NUM_DATA_POINTERS as _);
+        let datas = slice::from_raw_parts(datas, AV_NUM_DATA_POINTERS as _);
+        if linesizes[0] <= 0
+            || linesizes[1] <= 0
+            || datas[0].is_null()
+            || datas[1].is_null()
+        {
+            return;
+        }
+        let y_len = linesizes[0] as usize * height as usize;
+        let uv_len = linesizes[1] as usize * ((height as usize + 1) / 2);
+        let frame = DecodeFrame {
+            pixfmt: AVPixelFormat::AV_PIX_FMT_NV12,
+            width,
+            height,
+            data: vec![
+                slice::from_raw_parts(datas[0], y_len).to_vec(),
+                slice::from_raw_parts(datas[1], uv_len).to_vec(),
+            ],
+            linesize: vec![linesizes[0], linesizes[1]],
+            key: false,
+        };
+        let frames = &mut *(obj as *mut Vec<DecodeFrame>);
+        frames.push(frame);
     }
 
     extern "C" fn callback(data: *const u8, size: c_int, pts: i64, key: i32, obj: *const c_void) {
@@ -484,5 +559,40 @@ impl Drop for Encoder {
             let _ = Box::from_raw(self.frames);
             trace!("Encoder dropped");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_callback_copies_nv12_planes() {
+        let mut y = vec![7_u8; 16];
+        let mut uv = vec![9_u8; 8];
+        let mut datas = [std::ptr::null_mut(); AV_NUM_DATA_POINTERS as usize];
+        datas[0] = y.as_mut_ptr();
+        datas[1] = uv.as_mut_ptr();
+        let mut linesizes = [0_i32; AV_NUM_DATA_POINTERS as usize];
+        linesizes[0] = 4;
+        linesizes[1] = 4;
+        let mut frames = Vec::<DecodeFrame>::new();
+
+        unsafe {
+            Encoder::download_callback(
+                &mut frames as *mut _ as *const c_void,
+                4,
+                4,
+                AVPixelFormat::AV_PIX_FMT_NV12 as _,
+                linesizes.as_mut_ptr(),
+                datas.as_mut_ptr(),
+                0,
+            );
+        }
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data[0], y);
+        assert_eq!(frames[0].data[1], uv);
+        assert_eq!(frames[0].linesize, vec![4, 4]);
     }
 }

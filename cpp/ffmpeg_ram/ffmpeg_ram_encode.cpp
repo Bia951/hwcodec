@@ -112,6 +112,10 @@ _exit:
 namespace {
 typedef void (*RamEncodeCallback)(const uint8_t *data, int len, int64_t pts,
                                   int key, const void *obj);
+typedef void (*RamDecodeCallback)(const void *obj, int width, int height,
+                                  int pixfmt,
+                                  int linesize[AV_NUM_DATA_POINTERS],
+                                  uint8_t *data[AV_NUM_DATA_POINTERS], int key);
 
 typedef struct FfmpegDmabufPlane {
   int fd;
@@ -161,6 +165,7 @@ public:
   AVPacket *pkt_ = NULL;
   std::string name_;
   std::string mc_name_; // for mediacodec
+  std::string device_path_;
 
   int width_ = 0;
   int height_ = 0;
@@ -185,12 +190,14 @@ public:
 #endif
   AVFrame *hw_frame_ = NULL;
 
-  FFmpegRamEncoder(const char *name, const char *mc_name, int width, int height,
-                   int pixfmt, int align, int fps, int gop, int rc, int quality,
-                   int kbs, int q, int thread_count, int gpu,
+  FFmpegRamEncoder(const char *name, const char *mc_name,
+                   const char *device_path, int width, int height, int pixfmt,
+                   int align, int fps, int gop, int rc, int quality, int kbs,
+                   int q, int thread_count, int gpu,
                    RamEncodeCallback callback) {
     name_ = name;
     mc_name_ = mc_name ? mc_name : "";
+    device_path_ = device_path ? device_path : "";
     width_ = width;
     height_ = height;
     pixfmt_ = (AVPixelFormat)pixfmt;
@@ -256,13 +263,15 @@ public:
         // Multi-GPU: on Intel-iGPU + NVIDIA-dGPU laptops renderD128 is often the
         // NVIDIA node (nouveau), which exposes VAAPI but has NO encode entrypoints,
         // so the encoder silently fails and the caller falls back to software. So
-        // honor RUSTDESK_VAAPI_RENDER_NODE, else scan /dev/dri/renderD* and skip
-        // nvidia/nouveau, picking the first node we can create a VAAPI device on
-        // (i915/amdgpu). Done here (not via env) because the rustdesk server is a
-        // separate process that would not inherit an env override.
+        // Prefer the render node supplied by the capture backend so PRIME import
+        // stays on the source GPU. RUSTDESK_VAAPI_RENDER_NODE remains an explicit
+        // fallback override; without either, scan /dev/dri/renderD* and skip
+        // nvidia/nouveau, picking the first node that can derive a VAAPI device.
         std::vector<std::string> candidates;
         const char *forced = getenv("RUSTDESK_VAAPI_RENDER_NODE");
-        if (forced && *forced) {
+        if (!device_path_.empty()) {
+          candidates.emplace_back(device_path_);
+        } else if (forced && *forced) {
           candidates.emplace_back(forced);
         } else {
           for (int i = 128; i < 136; ++i) {
@@ -533,9 +542,131 @@ public:
     av_frame_free(&drm_frame);
     return ret;
   }
+
+  int download_dmabuf(const FfmpegDmabufFrame *dmabuf, const void *obj,
+                      RamDecodeCallback callback) {
+    if (!dmabuf || !callback) {
+      LOG_ERROR(std::string("download_dmabuf: invalid parameter"));
+      return -1;
+    }
+    if (hw_device_type_ == AV_HWDEVICE_TYPE_NONE ||
+        hw_pixfmt_ == AV_PIX_FMT_NONE || !c_ || !c_->hw_frames_ctx) {
+      LOG_ERROR(std::string("download_dmabuf: hardware device is unavailable"));
+      return -1;
+    }
+    if (dmabuf->encode_width != width_ || dmabuf->encode_height != height_ ||
+        dmabuf->width < width_ || dmabuf->height < height_) {
+      LOG_ERROR(std::string("download_dmabuf: frame size mismatch"));
+      return -1;
+    }
+
+    AVFrame *drm_frame = create_drm_prime_frame(dmabuf);
+    if (!drm_frame)
+      return -1;
+
+    int ret = -1;
+    AVPixelFormat drm_sw_format = drm_fourcc_to_av_pix_fmt(dmabuf->fourcc);
+    AVFrame *mapped_frame = av_frame_alloc();
+    AVFrame *filtered_frame = NULL;
+    AVFrame *sw_frame = NULL;
+    AVBufferRef *source_hw_frames_ctx = NULL;
+    if (!mapped_frame) {
+      LOG_ERROR(std::string("download_dmabuf: av_frame_alloc failed"));
+      goto _exit;
+    }
+
+    {
+      AVBufferRef *map_hw_frames_ctx = c_->hw_frames_ctx;
+#ifdef RUSTDESK_HAS_AVFILTER
+      if (drm_sw_format != pixfmt_) {
+        source_hw_frames_ctx = create_vaapi_hw_frames_ctx(drm_sw_format);
+        if (!source_hw_frames_ctx)
+          goto _exit;
+        map_hw_frames_ctx = source_hw_frames_ctx;
+      }
+#endif
+      ret = map_dmabuf_to_hw_frame(drm_frame, mapped_frame,
+                                   map_hw_frames_ctx,
+                                   AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
+      if (ret < 0) {
+        av_frame_unref(mapped_frame);
+        ret = map_dmabuf_to_hw_frame(drm_frame, mapped_frame,
+                                     map_hw_frames_ctx, AV_HWFRAME_MAP_READ);
+      }
+      if (ret < 0) {
+        LOG_ERROR(std::string("download_dmabuf: av_hwframe_map failed, ret = ") +
+                  av_err2str(ret));
+        goto _exit;
+      }
+    }
+
+    {
+      AVFrame *download_frame = mapped_frame;
+#ifdef RUSTDESK_HAS_AVFILTER
+      if (drm_sw_format != pixfmt_) {
+        filtered_frame = av_frame_alloc();
+        if (!filtered_frame) {
+          LOG_ERROR(std::string("download_dmabuf: filtered av_frame_alloc failed"));
+          ret = -1;
+          goto _exit;
+        }
+        ret = filter_vaapi_to_nv12(mapped_frame, filtered_frame);
+        if (ret < 0)
+          goto _exit;
+        download_frame = filtered_frame;
+      }
+#else
+      if (drm_sw_format != pixfmt_) {
+        LOG_ERROR(std::string("download_dmabuf: DRM fourcc requires VAAPI "
+                              "conversion, but libavfilter is unavailable"));
+        ret = -1;
+        goto _exit;
+      }
+#endif
+
+      sw_frame = av_frame_alloc();
+      if (!sw_frame) {
+        LOG_ERROR(std::string("download_dmabuf: software av_frame_alloc failed"));
+        ret = -1;
+        goto _exit;
+      }
+      ret = av_hwframe_transfer_data(sw_frame, download_frame, 0);
+      if (ret < 0) {
+        LOG_ERROR(std::string("download_dmabuf: av_hwframe_transfer_data failed, ret = ") +
+                  av_err2str(ret));
+        goto _exit;
+      }
+      if (sw_frame->format != AV_PIX_FMT_NV12) {
+        LOG_ERROR(std::string("download_dmabuf: unexpected software pixel format ") +
+                  std::to_string(sw_frame->format));
+        ret = -1;
+        goto _exit;
+      }
+      callback(obj, sw_frame->width, sw_frame->height, sw_frame->format,
+               sw_frame->linesize, sw_frame->data, 0);
+      ret = 0;
+    }
+
+  _exit:
+    if (source_hw_frames_ctx)
+      av_buffer_unref(&source_hw_frames_ctx);
+    if (sw_frame)
+      av_frame_free(&sw_frame);
+    if (filtered_frame)
+      av_frame_free(&filtered_frame);
+    if (mapped_frame)
+      av_frame_free(&mapped_frame);
+    av_frame_free(&drm_frame);
+    return ret;
+  }
 #else
   int encode_dmabuf(const FfmpegDmabufFrame *, const void *, uint64_t) {
     LOG_ERROR(std::string("encode_dmabuf: DRM PRIME input is unsupported on this platform"));
+    return -1;
+  }
+  int download_dmabuf(const FfmpegDmabufFrame *, const void *,
+                      RamDecodeCallback) {
+    LOG_ERROR(std::string("download_dmabuf: DRM PRIME input is unsupported on this platform"));
     return -1;
   }
 #endif
@@ -938,16 +1069,17 @@ private:
 } // namespace
 
 extern "C" FFmpegRamEncoder *
-ffmpeg_ram_new_encoder(const char *name, const char *mc_name, int width,
-                       int height, int pixfmt, int align, int fps, int gop,
-                       int rc, int quality, int kbs, int q, int thread_count,
-                       int gpu, int *linesize, int *offset, int *length,
+ffmpeg_ram_new_encoder(const char *name, const char *mc_name,
+                       const char *device_path, int width, int height,
+                       int pixfmt, int align, int fps, int gop, int rc,
+                       int quality, int kbs, int q, int thread_count, int gpu,
+                       int *linesize, int *offset, int *length,
                        RamEncodeCallback callback) {
   FFmpegRamEncoder *encoder = NULL;
   try {
-    encoder = new FFmpegRamEncoder(name, mc_name, width, height, pixfmt, align,
-                                   fps, gop, rc, quality, kbs, q, thread_count,
-                                   gpu, callback);
+    encoder = new FFmpegRamEncoder(name, mc_name, device_path, width, height,
+                                   pixfmt, align, fps, gop, rc, quality, kbs, q,
+                                   thread_count, gpu, callback);
     if (encoder) {
       if (encoder->init(linesize, offset, length)) {
         return encoder;
@@ -981,6 +1113,19 @@ extern "C" int ffmpeg_ram_encode_dmabuf(FFmpegRamEncoder *encoder,
     return encoder->encode_dmabuf(frame, obj, ms);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_ram_encode_dmabuf failed, ") +
+              std::string(e.what()));
+  }
+  return -1;
+}
+
+extern "C" int ffmpeg_ram_download_dmabuf(FFmpegRamEncoder *encoder,
+                                            const FfmpegDmabufFrame *frame,
+                                            const void *obj,
+                                            RamDecodeCallback callback) {
+  try {
+    return encoder->download_dmabuf(frame, obj, callback);
+  } catch (const std::exception &e) {
+    LOG_ERROR(std::string("ffmpeg_ram_download_dmabuf failed, ") +
               std::string(e.what()));
   }
   return -1;
